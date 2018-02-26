@@ -17,13 +17,13 @@ import (
 	"gopkg.in/ini.v1"
 )
 
-//
-var watcher *fsnotify.Watcher
-
-var dbs = make(map[string]uint64)
+type dbInfo struct {
+	lastCheckAt time.Time
+	size        uint64
+}
 
 var (
-	root = kingpin.Flag(
+	datadir = kingpin.Flag(
 		"path",
 		"Path to datadir.",
 	).Default("/var/lib/mysql").Short('p').String()
@@ -42,8 +42,11 @@ var (
 		"dry-run",
 		"Do not revoke permissions",
 	).Short('d').Bool()
-	log *zap.SugaredLogger
-	dsn string
+	log     *zap.SugaredLogger
+	dsn     string
+	watcher *fsnotify.Watcher
+
+	dbs = make(map[string]dbInfo)
 )
 
 func init() {
@@ -62,10 +65,10 @@ func init() {
 	log = logger.Sugar()
 }
 
-// main
 func main() {
 	*limit = *limit * uint64(1024*1024)
-	log.Infof("Watching %s with limit %dMB", *root, *limit/1024/1024)
+	*datadir += "/*"
+	log.Infof("Starting watch on %s with limit %d", *datadir, humanize.Bytes(*limit))
 	var err error
 	dsn, err = parseMycnf(*configMycnf)
 	if err != nil {
@@ -75,11 +78,15 @@ func main() {
 	watcher, _ = fsnotify.NewWatcher()
 	defer watcher.Close()
 
-	if err := filepath.Walk(*root, watchDir); err != nil {
-		log.Errorf("ERROR: %s", err)
-	}
-
 	done := make(chan bool)
+	c1 := make(chan string)
+
+	go func() {
+		for {
+			c1 <- *datadir
+			time.Sleep(time.Minute)
+		}
+	}()
 
 	go func() {
 		for {
@@ -87,67 +94,99 @@ func main() {
 			// watch for events
 			case event := <-watcher.Events:
 				log.Debugf("EVENT! %#v %s", event, event.String())
+				now := time.Now()
 
 				if event.Op&fsnotify.Create == fsnotify.Create {
-					f, err := os.Stat(event.Name)
-					if err != nil {
-						log.Errorf("Got err: %s", err)
-					}
-					if f.IsDir() {
-						dirName := filepath.Base(event.Name)
-						if isUserDb(dirName) {
-							watcher.Add(event.Name)
-							dbs[dirName], _ = dirSize(event.Name)
-						}
+					dirName := filepath.Base(event.Name)
+					if isUserDb(dirName) {
+						watcher.Add(event.Name)
 					}
 				} else if event.Op&fsnotify.Remove == fsnotify.Remove {
 
 					_, exists := dbs[filepath.Base(event.Name)]
 					if exists {
+						log.Infof("Removing %s from watch list.", filepath.Base(event.Name))
 						delete(dbs, filepath.Base(event.Name))
 					}
 				} else if event.Op&fsnotify.Write == fsnotify.Write {
 					f, e := os.Stat(event.Name)
 					if e != nil {
-						log.Errorf("Could not stat() on %s", event.Name)
+						// Most likely tmp table was removed
+						continue
 					}
-					dirName := filepath.Base(event.Name)
 
-					// Recalculate direcotry size
+					dirName := filepath.Base(event.Name)
 					if !f.IsDir() {
 						dirName = filepath.Base(filepath.Dir(event.Name))
 					}
+
 					if isUserDb(dirName) {
-						dbs[dirName], _ = dirSize(filepath.Dir(event.Name))
+						if time.Since(dbs[dirName].lastCheckAt) > 5*time.Second {
+							size := dirSize(filepath.Dir(event.Name))
+							if size > dbs[dirName].size {
+								if *dryRun != true {
+									revokePermissions(dirName)
+								}
+							}
+							dbs[dirName] = dbInfo{size: size, lastCheckAt: now}
+						}
 					} else {
 						log.Infof("Removing %s from watch list.", event.Name)
-						watcher.Remove(event.Name)
+						err = watcher.Remove(event.Name)
+						if err != nil {
+							log.Errorf("Could not remove from watch list: %s", err)
+						}
 					}
+
 				} else if event.Op&fsnotify.Chmod == fsnotify.Chmod {
 					// Don't even log
+				} else if event.Op&fsnotify.Rename == fsnotify.Rename {
+					// Don't even log
 				} else {
-					fmt.Println("Operation not handled.")
+					log.Infof("Unhandled event! %#v %s", event, event.String())
 				}
 
 				// watch for errors
 			case err := <-watcher.Errors:
 				log.Errorf("ERROR", "err", err)
+			case <-c1:
+				scanDatadir()
 			}
+
 		}
 	}()
 
 	<-done
 }
 
+func scanDatadir() {
+	log.Infof("Scanning datadir: %s", *datadir)
+	entries, _ := filepath.Glob(*datadir)
+	for _, entry := range entries {
+		dirName := filepath.Base(entry)
+		_, exists := dbs[dirName]
+		if exists {
+			continue
+		}
+		if isUserDb(dirName) {
+			log.Infof("Watching %s", dirName)
+			watcher.Add(entry)
+			dbs[dirName] = dbInfo{}
+		}
+	}
+	log.Infof("Databases watching: %d", len(dbs))
+}
+
 func watchDir(path string, fi os.FileInfo, err error) error {
 	if fi.Mode().IsDir() {
 		dirName := filepath.Base(path)
-		if isUserDb(dirName) {
-			dbs[dirName], _ = dirSize(path)
-		}
-		if isUserDb(dirName) || path == *root {
-			log.Infof("Watching %s", path)
-			return watcher.Add(path)
+		_, exists := dbs[dirName]
+		if exists {
+			return nil
+		} else {
+			if isUserDb(dirName) {
+				return watcher.Add(path)
+			}
 		}
 	}
 	return nil
@@ -158,9 +197,9 @@ func isUserDb(name string) bool {
 	return match
 }
 
-func dirSize(path string) (uint64, error) {
+func dirSize(path string) uint64 {
 	var size uint64
-	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+	filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
 		if !info.IsDir() {
 			size += uint64(info.Size())
 		}
@@ -172,15 +211,12 @@ func dirSize(path string) (uint64, error) {
 		log.Warnf(
 			"%s exceeded limit of %dMB with it's %s. I must keep it fit.",
 			filepath.Base(path),
-			*limit/1024/1024,
+			humanize.Bytes(*limit),
 			humanize.Bytes(size),
 		)
 		dbName := filepath.Base(path)
-		if *dryRun != true {
-			revokePermissions(dbName)
-		}
 	}
-	return size, err
+	return size
 }
 
 func revokePermissions(dbName string) {
@@ -231,20 +267,4 @@ func parseMycnf(config interface{}) (string, error) {
 		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/", user, password, host, port)
 	}
 	return dsn, nil
-}
-
-func checkWatch(path string) {
-	f, err := os.Stat(path)
-	if err != nil {
-		log.Errorf("Got err:", err)
-	}
-	if !f.IsDir() {
-
-	} else {
-		dirName := filepath.Base(path)
-		if isUserDb(dirName) {
-			watcher.Add(path)
-			dbs[dirName], _ = dirSize(path)
-		}
-	}
 }
