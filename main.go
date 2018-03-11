@@ -68,7 +68,7 @@ func init() {
 func main() {
 	*limit = *limit * uint64(1024*1024)
 	*datadir += "/*"
-	log.Infof("Starting watch on %s with limit %d", *datadir, humanize.Bytes(*limit))
+	log.Infof("Starting watch on %s with limit %s", *datadir, humanize.IBytes(*limit))
 	var err error
 	dsn, err = parseMycnf(*configMycnf)
 	if err != nil {
@@ -169,7 +169,7 @@ func scanDatadir() {
 			continue
 		}
 		if isUserDb(dirName) {
-			log.Infof("Watching %s", dirName)
+			log.Debugf("Watching %s", dirName)
 			watcher.Add(entry)
 			dbs[dirName] = dbInfo{}
 		}
@@ -199,6 +199,7 @@ func isUserDb(name string) bool {
 
 func dirSize(path string) uint64 {
 	var size uint64
+	size = 0
 	filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
 		if !info.IsDir() {
 			size += uint64(info.Size())
@@ -209,12 +210,11 @@ func dirSize(path string) uint64 {
 
 	if size >= *limit {
 		log.Warnf(
-			"%s exceeded limit of %dMB with it's %s. I must keep it fit.",
+			"%s exceeded limit of %s with it's %s. I must keep it fit.",
 			filepath.Base(path),
-			humanize.Bytes(*limit),
-			humanize.Bytes(size),
+			humanize.IBytes(*limit),
+			humanize.IBytes(size),
 		)
-		dbName := filepath.Base(path)
 	}
 	return size
 }
