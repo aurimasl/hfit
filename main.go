@@ -123,7 +123,7 @@ func main() {
 					if isUserDb(dirName) {
 						if time.Since(dbs[dirName].lastCheckAt) > 5*time.Second {
 							size := dirSize(filepath.Dir(event.Name))
-							if size > dbs[dirName].size {
+							if size > *limit {
 								if *dryRun != true {
 									revokePermissions(dirName)
 								}
@@ -201,8 +201,13 @@ func dirSize(path string) uint64 {
 	var size uint64
 	size = 0
 	filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			log.Infof("Failure accessing a path %q: %v", path, err)
+			return err
+		}
 		if !info.IsDir() {
 			size += uint64(info.Size())
+			return nil
 		}
 		return err
 	})
@@ -226,25 +231,51 @@ func revokePermissions(dbName string) {
 		return
 	}
 	defer db.Close()
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(3)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(1 * time.Minute)
 
-	_, err = db.Exec(
+	stmt, err := db.Prepare(
 		fmt.Sprintf(
-			"UPDATE mysql.db SET Insert_priv='N' WHERE Db = '%s'",
+			"SELECT User, Host FROM mysql.db WHERE Db = '%s' AND (Insert_priv = 'Y' OR Update_priv = 'Y')",
 			dbName,
 		),
 	)
 	if err != nil {
-		panic(err.Error()) // proper error handling instead of panic
+		panic(err.Error())
 	}
-	_, err = db.Exec("FLUSH PRIVILEGES")
+	defer stmt.Close()
+	rows, err := stmt.Query()
 	if err != nil {
-		panic(err.Error()) // proper error handling instead of panic
+		panic(err.Error())
+	}
+	stmt.Close()
+	defer rows.Close()
+	for rows.Next() {
+		var user string
+		var host string
+		if err := rows.Scan(&user, &host); err != nil {
+			panic(err.Error())
+		}
+		log.Infof("REVOKE INSERT, UPDATE ON %s.* FROM '%s'@'%s'", dbName, user, host)
+		_, err = db.Exec(
+			fmt.Sprintf(
+				"REVOKE INSERT, UPDATE ON %s.* FROM '%s'@'%s'",
+				dbName,
+				user,
+				host,
+			),
+		)
+		if err != nil {
+			panic(err.Error())
+		}
+		err = rows.Err()
+		if err != nil {
+			panic(err)
+		}
 	}
 	log.Infof("Permissions revoked on %s", dbName)
-
+	return
 }
 
 func parseMycnf(config interface{}) (string, error) {
