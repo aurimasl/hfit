@@ -29,7 +29,7 @@ var (
 	).Default("/var/lib/mysql").Short('p').String()
 	limit = kingpin.Flag(
 		"limit", "DB limit in MB.",
-	).Default("3072").Short('l').Uint64()
+	).Default("3174").Short('l').Uint64()
 	configMycnf = kingpin.Flag(
 		"config",
 		"Path to .my.cnf file to read MySQL credentials from.",
@@ -123,7 +123,13 @@ func main() {
 					if isUserDb(dirName) {
 						if time.Since(dbs[dirName].lastCheckAt) > 5*time.Second {
 							size := dirSize(filepath.Dir(event.Name))
-							if size > *limit {
+							if size > *limit && size > dbs[dirName].size {
+								log.Warnf(
+									"%s exceeded limit of %s with it's %s. I must keep it fit.",
+									dirName,
+									humanize.IBytes(*limit),
+									humanize.IBytes(size),
+								)
 								if *dryRun != true {
 									revokePermissions(dirName)
 								}
@@ -148,7 +154,7 @@ func main() {
 
 				// watch for errors
 			case err := <-watcher.Errors:
-				log.Errorf("ERROR", "err", err)
+				log.Errorf("ERROR", err)
 			case <-c1:
 				scanDatadir()
 			}
@@ -212,15 +218,6 @@ func dirSize(path string) uint64 {
 		return err
 	})
 	log.Debugf("Size of %s is %d", path, size)
-
-	if size >= *limit {
-		log.Warnf(
-			"%s exceeded limit of %s with it's %s. I must keep it fit.",
-			filepath.Base(path),
-			humanize.IBytes(*limit),
-			humanize.IBytes(size),
-		)
-	}
 	return size
 }
 
@@ -237,7 +234,7 @@ func revokePermissions(dbName string) {
 
 	stmt, err := db.Prepare(
 		fmt.Sprintf(
-			"SELECT User, Host FROM mysql.db WHERE Db = '%s' AND (Insert_priv = 'Y' OR Update_priv = 'Y')",
+			"SELECT User, Host FROM mysql.db WHERE Db = '%s' AND (Insert_priv = 'Y' OR Update_priv = 'Y' OR Create_priv = 'Y' OR Index_priv = 'Y')",
 			dbName,
 		),
 	)
@@ -257,10 +254,10 @@ func revokePermissions(dbName string) {
 		if err := rows.Scan(&user, &host); err != nil {
 			panic(err.Error())
 		}
-		log.Infof("REVOKE INSERT, UPDATE ON %s.* FROM '%s'@'%s'", dbName, user, host)
+		log.Infof("REVOKE INSERT, UPDATE, CREATE, INDEX ON %s.* FROM '%s'@'%s'", dbName, user, host)
 		_, err = db.Exec(
 			fmt.Sprintf(
-				"REVOKE INSERT, UPDATE ON %s.* FROM '%s'@'%s'",
+				"REVOKE INSERT, UPDATE, CREATE, INDEX ON %s.* FROM '%s'@'%s'",
 				dbName,
 				user,
 				host,
