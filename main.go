@@ -10,7 +10,7 @@ import (
 	"time"
 
 	humanize "github.com/dustin/go-humanize"
-	"github.com/go-fsnotify/fsnotify"
+	"github.com/fsnotify/fsnotify"
 	_ "github.com/go-sql-driver/mysql"
 	"go.uber.org/zap"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
