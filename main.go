@@ -10,7 +10,7 @@ import (
 	"time"
 
 	humanize "github.com/dustin/go-humanize"
-	"github.com/go-fsnotify/fsnotify"
+	"github.com/fsnotify/fsnotify"
 	_ "github.com/go-sql-driver/mysql"
 	"go.uber.org/zap"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
@@ -102,11 +102,30 @@ func main() {
 						watcher.Add(event.Name)
 					}
 				} else if event.Op&fsnotify.Remove == fsnotify.Remove {
-
-					_, exists := dbs[filepath.Base(event.Name)]
+					dirName := filepath.Base(event.Name)
+					_, exists := dbs[dirName]
 					if exists {
-						log.Infof("Removing %s from watch list.", filepath.Base(event.Name))
-						delete(dbs, filepath.Base(event.Name))
+						log.Infof("Removing %s from watch list.", dirName)
+						delete(dbs, dirName)
+						continue
+					}
+					dirName = filepath.Base(filepath.Dir(event.Name))
+					if time.Since(dbs[dirName].lastCheckAt) > 5*time.Second {
+						if isUserDb(dirName) {
+							size := dirSize(filepath.Dir(event.Name))
+							if size < *limit && dbs[dirName].size > *limit {
+								log.Warnf(
+									"%s below limit of %s with it's %s. Restoring permissions.",
+									dirName,
+									humanize.IBytes(*limit),
+									humanize.IBytes(size),
+								)
+								if *dryRun != true {
+									restorePermissions(dirName)
+								}
+							}
+							dbs[dirName] = dbInfo{size: size, lastCheckAt: now}
+						}
 					}
 				} else if event.Op&fsnotify.Write == fsnotify.Write {
 					f, e := os.Stat(event.Name)
@@ -123,7 +142,17 @@ func main() {
 					if isUserDb(dirName) {
 						if time.Since(dbs[dirName].lastCheckAt) > 5*time.Second {
 							size := dirSize(filepath.Dir(event.Name))
-							if size > *limit && size > dbs[dirName].size {
+							if size < *limit && dbs[dirName].size > *limit {
+								log.Warnf(
+									"%s below limit of %s with it's %s. Restoring permissions.",
+									dirName,
+									humanize.IBytes(*limit),
+									humanize.IBytes(size),
+								)
+								if *dryRun != true {
+									restorePermissions(dirName)
+								}
+							} else if size > *limit+100 && size > dbs[dirName].size {
 								log.Warnf(
 									"%s exceeded limit of %s with it's %s. I must keep it fit.",
 									dirName,
@@ -241,7 +270,6 @@ func revokePermissions(dbName string) {
 	if err != nil {
 		panic(err.Error())
 	}
-	defer stmt.Close()
 	rows, err := stmt.Query()
 	if err != nil {
 		panic(err.Error())
@@ -272,6 +300,59 @@ func revokePermissions(dbName string) {
 		}
 	}
 	log.Infof("Permissions revoked on %s", dbName)
+	return
+}
+
+func restorePermissions(dbName string) {
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		log.Infof("Error opening connection to database: %s", err)
+		return
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(3)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(1 * time.Minute)
+
+	stmt, err := db.Prepare(
+		fmt.Sprintf(
+			"SELECT User, Host FROM mysql.db WHERE Db = '%s' AND (Insert_priv = 'N' OR Update_priv = 'N' OR Create_priv = 'N' OR Index_priv = 'N')",
+			dbName,
+		),
+	)
+	if err != nil {
+		panic(err.Error())
+	}
+	rows, err := stmt.Query()
+	if err != nil {
+		panic(err.Error())
+	}
+	stmt.Close()
+	defer rows.Close()
+	for rows.Next() {
+		var user string
+		var host string
+		if err := rows.Scan(&user, &host); err != nil {
+			panic(err.Error())
+		}
+		log.Infof("GRANT INSERT, UPDATE, CREATE, INDEX ON %s.* TO '%s'@'%s'", dbName, user, host)
+		_, err = db.Exec(
+			fmt.Sprintf(
+				"GRANT INSERT, UPDATE, CREATE, INDEX ON %s.* TO '%s'@'%s'",
+				dbName,
+				user,
+				host,
+			),
+		)
+		if err != nil {
+			panic(err.Error())
+		}
+		err = rows.Err()
+		if err != nil {
+			panic(err)
+		}
+	}
+	log.Infof("Permissions granted on %s", dbName)
 	return
 }
 
